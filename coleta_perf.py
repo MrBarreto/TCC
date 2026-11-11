@@ -6,10 +6,12 @@ Roda no host da VM, como root:   sudo ./coleta_perf.py [--cpus 0-5] [--duracao 6
 Escuta na porta 8000 e entende duas mensagens, sem parametros (enviadas pelo clientes.py):
   POST /siga   comeca a coletar: uma janela de --duracao s a cada --periodo s,
                a primeira imediatamente (as seguintes em 0, periodo, 2*periodo, ...)
+               Com ?rodada=n64_r1 a pasta se chama <outdir>/n64_r1/ (se ja existir, e reaproveitada);
+               sem o parametro, <outdir>/sessao_<epoch>/
   POST /pare   encerra: interrompe a janela em curso, se houver, e cancela as proximas
   GET  /status mostra se ha coleta em curso
 
-Cada /siga cria <outdir>/sessao_<epoch>/ com:
+Cada /siga cria uma pasta de sessao (nome acima) com:
   metricas.csv  UMA LINHA POR JANELA: epoch de inicio e fim, contagens totais das CPUs
                 (somadas), IPC e faltas por mil instrucoes (MPKI)
   eventos.log   mensagens recebidas e erros do perf
@@ -33,6 +35,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 # O grupo {} faz o perf ler os cinco eventos juntos. Atencao: se um evento do grupo nao for
 # suportado pela CPU, o grupo inteiro vira <not counted>.
@@ -142,22 +145,26 @@ class Coletor:
     def ativo(self):
         return self.thread is not None and self.thread.is_alive()
 
-    def siga(self):
-        """Inicia a coleta. Retorna o nome da sessao, ou None se ja ha coleta em curso."""
+    def siga(self, rodada=None):
+        """Inicia a coleta. Retorna (codigo HTTP, texto): 200 com o nome da pasta da sessao, ou 409
+        se ja ha coleta em curso. Se a pasta de `rodada` ja existe, os arquivos sao sobrescritos."""
         with self.lock:
             if self.ativo():
-                return None
-            base = f"sessao_{time.time():.0f}"
-            nome, i = base, 1
-            while os.path.exists(os.path.join(self.a.outdir, nome)):
-                i += 1
-                nome = f"{base}_{i}"
+                return 409, "ja ha coleta em curso"
+            if rodada:
+                nome = rodada
+            else:
+                base = f"sessao_{time.time():.0f}"
+                nome, i = base, 1
+                while os.path.exists(os.path.join(self.a.outdir, nome)):
+                    i += 1
+                    nome = f"{base}_{i}"
             pasta = os.path.join(self.a.outdir, nome)
-            os.makedirs(pasta)
+            os.makedirs(pasta, exist_ok=True)
             self.parar.clear()
             self.thread = threading.Thread(target=self.laco, args=(pasta,), daemon=True)
             self.thread.start()
-            return nome
+            return 200, nome
 
     def pare(self):
         """Encerra a coleta. Retorna True se havia coleta em curso."""
@@ -176,7 +183,7 @@ class Coletor:
 
     def laco(self, pasta):
         a = self.a
-        with open(os.path.join(pasta, "eventos.log"), "a", buffering=1) as ev, \
+        with open(os.path.join(pasta, "eventos.log"), "w", buffering=1) as ev, \
                 open(os.path.join(pasta, "metricas.csv"), "w", newline="", buffering=1) as mf:
             w = csv.DictWriter(mf, fieldnames=CAMPOS)
             w.writeheader()
@@ -233,16 +240,14 @@ def faz_handler(col):
             print(f"[{agora()}] {self.client_address[0]} {fmt % args}", flush=True)
 
         def do_POST(self):
-            if self.path == "/siga":
-                nome = col.siga()
-                if nome is None:
-                    self._resp(409, "ja ha coleta em curso")
-                else:
-                    self._resp(200, nome)
-            elif self.path == "/pare":
+            u = urlsplit(self.path)
+            if u.path == "/siga":
+                rodada = parse_qs(u.query).get("rodada", [None])[0]
+                self._resp(*col.siga(rodada))
+            elif u.path == "/pare":
                 self._resp(200, "parado" if col.pare() else "nada a parar")
             else:
-                self._resp(404, "use POST /siga ou POST /pare")
+                self._resp(404, "use POST /siga[?rodada=nome] ou POST /pare")
 
         def do_GET(self):
             if self.path == "/status":
