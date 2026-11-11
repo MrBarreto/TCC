@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Coleta perf stat no host da VM durante uma rodada de clientes.
 
-Roda no host da VM, como root:   sudo ./coleta_perf.py [--cpus 1-5] [--duracao 60] [--periodo 300]
+Roda no host da VM, como root:   sudo ./coleta_perf.py [--cpus 0-5] [--duracao 60] [--periodo 120]
 
 Escuta na porta 8000 e entende duas mensagens, sem parametros (enviadas pelo clientes.py):
   POST /siga   comeca a coletar: uma janela de --duracao s a cada --periodo s,
@@ -18,13 +18,15 @@ Cada /siga cria <outdir>/sessao_<epoch>/ com:
 Eventos (Secao 3.3): cycles, instructions, L1-dcache-load-misses, L1-icache-load-misses,
 LLC-load-misses, lidos em grupo. Contam toda a atividade das CPUs (guest e host).
 Colunas de metricas.csv: ipc = instructions/cycles; *_mpki = 1000*misses/instructions;
+cpus_uso_pct = uso das CPUs de --cpus (somadas) e global_uso_pct = uso de todas as CPUs do host (%),
+calculados com as diferencas de /proc/stat entre o inicio e o fim do perf (media da janela):
+100 * (1 - (idle+iowait) / total); inclui o tempo do convidado;
 cobertura_min_pct = menor % do tempo em que um evento foi contado (100 = sem multiplexacao);
 sem_contagem = eventos que o perf nao conseguiu contar (nao suportado / nao contado).
 """
 import argparse
 import csv
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -37,7 +39,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 EVENTOS = "{cycles,instructions,L1-dcache-load-misses,L1-icache-load-misses,LLC-load-misses}"
 CAMPOS = ["janela", "epoch_inicio", "epoch_fim", "duracao_s", "interrompida", "codigo_saida",
           "cycles", "instructions", "l1d_misses", "l1i_misses", "llc_misses",
-          "ipc", "l1d_mpki", "l1i_mpki", "llc_mpki", "cobertura_min_pct", "sem_contagem"]
+          "ipc", "l1d_mpki", "l1i_mpki", "llc_mpki", "cpus_uso_pct", "global_uso_pct",
+          "cobertura_min_pct", "sem_contagem"]
 
 
 def agora():
@@ -67,7 +70,48 @@ def le_contagens(caminho):
     return r
 
 
-def linha_metricas(k, t_ini, t_fim, interrompida, rc, cont):
+def lista_cpus(spec):
+    """'0-5' ou '0,2-4' -> [0, 1, 2, 3, 4, 5] ou [0, 2, 3, 4]."""
+    r = []
+    for p in spec.split(","):
+        if "-" in p:
+            a, b = p.split("-")
+            r += range(int(a), int(b) + 1)
+        else:
+            r.append(int(p))
+    return r
+
+
+def le_proc_stat(cpus):
+    """{'cpus': (ocioso, total), 'global': (ocioso, total)} em jiffies, de /proc/stat: soma das
+    CPUs de `cpus` e linha 'cpu' (todas). total = user..steal; guest ja esta dentro de user."""
+    r = {"cpus": [0, 0], "global": [0, 0]}
+    with open("/proc/stat") as f:
+        for l in f:
+            c = l.split()
+            if not c or not c[0].startswith("cpu"):
+                continue
+            v = ([int(x) for x in c[1:9]] + [0] * 8)[:8]  # user nice system idle iowait irq softirq steal
+            par = (v[3] + v[4], sum(v))
+            if c[0] == "cpu":
+                r["global"] = list(par)
+            elif int(c[0][3:]) in cpus:
+                r["cpus"][0] += par[0]
+                r["cpus"][1] += par[1]
+    return r
+
+
+def uso_cpu(antes, depois):
+    """{'cpus_uso_pct', 'global_uso_pct'}: 100*(1 - d_ocioso/d_total) entre duas leituras."""
+    r = {}
+    for esc in ("cpus", "global"):
+        d_oc = depois[esc][0] - antes[esc][0]
+        d_tot = depois[esc][1] - antes[esc][1]
+        r[f"{esc}_uso_pct"] = round(100.0 * (1 - d_oc / d_tot), 2) if d_tot > 0 else None
+    return r
+
+
+def linha_metricas(k, t_ini, t_fim, interrompida, rc, cont, uso):
     g = lambda e: cont.get(e, (None, None))[0]
     cyc, ins = g("cycles"), g("instructions")
     dm, im, lm = g("L1-dcache-load-misses"), g("L1-icache-load-misses"), g("LLC-load-misses")
@@ -79,6 +123,7 @@ def linha_metricas(k, t_ini, t_fim, interrompida, rc, cont):
         "cycles": cyc, "instructions": ins, "l1d_misses": dm, "l1i_misses": im, "llc_misses": lm,
         "ipc": round(ins / cyc, 4) if cyc and ins is not None else None,
         "l1d_mpki": mpki(dm), "l1i_mpki": mpki(im), "llc_mpki": mpki(lm),
+        **uso,
         "cobertura_min_pct": min(pcts) if pcts else None,
         "sem_contagem": ";".join(e for e, (v, _) in cont.items() if v is None),
     }
@@ -141,12 +186,13 @@ class Coletor:
             while True:
                 k += 1
                 arq = os.path.join(pasta, f"w{k:02d}.csv")
-                cmd = [a.perf, "stat", "-a", "-C", a.cpus, "-x", ",", "-e", a.eventos,
+                cmd = ["perf", "stat", "-a", "-C", a.cpus, "-x", ",", "-e", a.eventos,
                        "-o", arq, "--", "sleep", str(a.duracao)]
                 with self.lock:           # evita iniciar um perf depois de um /pare
                     if self.parar.is_set():
                         break
                     t_ini = time.time()
+                    antes = le_proc_stat(a.cpu_lista)
                     try:
                         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                                      stdout=subprocess.DEVNULL, stderr=ev,
@@ -156,10 +202,12 @@ class Coletor:
                         break
                     proc = self.proc
                 rc = proc.wait()
+                depois = le_proc_stat(a.cpu_lista)    # carimbo de uso de CPU no fim do perf
                 t_fim = time.time()
                 interrompida = int(self.parar.is_set() and (t_fim - t_ini) < a.duracao - 0.5)
                 cont = le_contagens(arq)
-                w.writerow(linha_metricas(k, t_ini, t_fim, interrompida, rc, cont))
+                w.writerow(linha_metricas(k, t_ini, t_fim, interrompida, rc, cont,
+                                          uso_cpu(antes, depois)))
                 falhou = rc != 0 and not interrompida
                 if falhou:
                     ev.write(f"{time.time():.3f} perf terminou com codigo {rc} na janela {k}\n")
@@ -207,33 +255,22 @@ def faz_handler(col):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cpus", default="1-5", help="CPUs do host medidas pelo perf (padrao: 1-5)")
+    ap.add_argument("--cpus", default="0-5", help="CPUs do host medidas pelo perf (padrao: 0-5)")
     ap.add_argument("--duracao", type=int, default=60, help="duracao de cada janela, em s")
-    ap.add_argument("--periodo", type=int, default=300,
+    ap.add_argument("--periodo", type=int, default=120,
                     help="intervalo entre os inicios de janelas, em s (>= duracao)")
     ap.add_argument("--porta", type=int, default=8000)
     ap.add_argument("--bind", default="0.0.0.0",
                     help="endereco de escuta; use o IP da interface do cabo direto")
     ap.add_argument("--outdir", default="perf_out")
-    ap.add_argument("--perf", default="perf", help="executavel do perf")
     ap.add_argument("--eventos", default=EVENTOS,
                     help="lista de eventos do perf (para testar em CPU sem todos os eventos, "
                          "ex.: '{cycles,instructions,L1-dcache-load-misses}')")
     a = ap.parse_args()
 
+    a.cpu_lista = lista_cpus(a.cpus)
     if a.duracao < 1 or a.periodo < a.duracao:
         sys.exit("use --duracao >= 1 e --periodo >= --duracao")
-    if shutil.which(a.perf) is None:
-        sys.exit(f"perf nao encontrado ({a.perf})")
-    if os.geteuid() != 0:
-        print("AVISO: fora do root o perf pode negar o acesso aos contadores (use sudo)",
-              file=sys.stderr)
-    try:
-        if open("/proc/sys/kernel/nmi_watchdog").read().strip() == "1":
-            print("AVISO: nmi_watchdog ligado ocupa um contador; para medir sem risco de "
-                  "multiplexacao: sudo sysctl kernel.nmi_watchdog=0", file=sys.stderr)
-    except OSError:
-        pass
 
     os.makedirs(a.outdir, exist_ok=True)
     col = Coletor(a)
