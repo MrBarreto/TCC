@@ -21,8 +21,8 @@ Eventos (Secao 3.3): cycles, instructions, L1-dcache-load-misses, L1-icache-load
 LLC-load-misses, lidos em grupo. Contam toda a atividade das CPUs (guest e host).
 Colunas de metricas.csv: ipc = instructions/cycles; *_mpki = 1000*misses/instructions;
 cpus_uso_pct = uso das CPUs de --cpus (somadas) e global_uso_pct = uso de todas as CPUs do host (%),
-calculados com as diferencas de /proc/stat entre o inicio e o fim do perf (media da janela):
-100 * (1 - (idle+iowait) / total); inclui o tempo do convidado;
+lidos com psutil.cpu_percent (media entre o inicio e o fim do perf, ou seja, da janela); inclui o
+tempo do convidado;
 cobertura_min_pct = menor % do tempo em que um evento foi contado (100 = sem multiplexacao);
 sem_contagem = eventos que o perf nao conseguiu contar (nao suportado / nao contado).
 """
@@ -34,6 +34,8 @@ import subprocess
 import sys
 import threading
 import time
+
+import psutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -85,33 +87,19 @@ def lista_cpus(spec):
     return r
 
 
-def le_proc_stat(cpus):
-    """{'cpus': (ocioso, total), 'global': (ocioso, total)} em jiffies, de /proc/stat: soma das
-    CPUs de `cpus` e linha 'cpu' (todas). total = user..steal; guest ja esta dentro de user."""
-    r = {"cpus": [0, 0], "global": [0, 0]}
-    with open("/proc/stat") as f:
-        for l in f:
-            c = l.split()
-            if not c or not c[0].startswith("cpu"):
-                continue
-            v = ([int(x) for x in c[1:9]] + [0] * 8)[:8]  # user nice system idle iowait irq softirq steal
-            par = (v[3] + v[4], sum(v))
-            if c[0] == "cpu":
-                r["global"] = list(par)
-            elif int(c[0][3:]) in cpus:
-                r["cpus"][0] += par[0]
-                r["cpus"][1] += par[1]
-    return r
+def inicia_uso():
+    """Marca o inicio da janela: o psutil passa a medir o uso desde esta chamada."""
+    psutil.cpu_percent(interval=None, percpu=True)
+    psutil.cpu_percent(interval=None)
 
 
-def uso_cpu(antes, depois):
-    """{'cpus_uso_pct', 'global_uso_pct'}: 100*(1 - d_ocioso/d_total) entre duas leituras."""
-    r = {}
-    for esc in ("cpus", "global"):
-        d_oc = depois[esc][0] - antes[esc][0]
-        d_tot = depois[esc][1] - antes[esc][1]
-        r[f"{esc}_uso_pct"] = round(100.0 * (1 - d_oc / d_tot), 2) if d_tot > 0 else None
-    return r
+def le_uso(cpus):
+    """{'cpus_uso_pct', 'global_uso_pct'}: uso medio (%) das CPUs de `cpus` e de todas as CPUs
+    desde a ultima chamada de inicia_uso()."""
+    por_cpu = psutil.cpu_percent(interval=None, percpu=True)
+    sel = [por_cpu[n] for n in cpus]
+    return {"cpus_uso_pct": round(sum(sel) / len(sel), 2),
+            "global_uso_pct": round(psutil.cpu_percent(interval=None), 2)}
 
 
 def linha_metricas(k, t_ini, t_fim, interrompida, rc, cont, uso):
@@ -199,7 +187,7 @@ class Coletor:
                     if self.parar.is_set():
                         break
                     t_ini = time.time()
-                    antes = le_proc_stat(a.cpu_lista)
+                    inicia_uso()
                     try:
                         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                                      stdout=subprocess.DEVNULL, stderr=ev,
@@ -209,12 +197,12 @@ class Coletor:
                         break
                     proc = self.proc
                 rc = proc.wait()
-                depois = le_proc_stat(a.cpu_lista)    # carimbo de uso de CPU no fim do perf
+                uso = le_uso(a.cpu_lista)             # carimbo de uso de CPU no fim do perf
                 t_fim = time.time()
                 interrompida = int(self.parar.is_set() and (t_fim - t_ini) < a.duracao - 0.5)
                 cont = le_contagens(arq)
                 w.writerow(linha_metricas(k, t_ini, t_fim, interrompida, rc, cont,
-                                          uso_cpu(antes, depois)))
+                                          uso))
                 falhou = rc != 0 and not interrompida
                 if falhou:
                     ev.write(f"{time.time():.3f} perf terminou com codigo {rc} na janela {k}\n")
