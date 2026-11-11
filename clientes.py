@@ -32,7 +32,7 @@ import psutil
 ap = argparse.ArgumentParser()
 ap.add_argument("n", type=int, help="numero de clientes")
 ap.add_argument("--run", default="r1", help="rotulo da repeticao (r1..r5)")
-ap.add_argument("--url", default="http://192.168.122.30/videos/cat.mp4")
+ap.add_argument("--url", default="http://192.168.0.4/videos/cat.mp4")
 ap.add_argument("--outdir", default="runs")
 ap.add_argument("--perf-host", default=None, metavar="HOST[:PORTA]",
                 help="host que roda coleta_perf.py (omitido: nao coleta perf)")
