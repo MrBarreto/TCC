@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Dispara N clientes mpv em paralelo; cada um grava o seu .log bruto.
 
-Uso:  ./clientes.py 16 --run r1
-Saida: <outdir>/n16_r1/p01.log ... p16.log  e  t0.txt (instante de inicio, epoch)
+Uso:  ./clientes.py 16 --run r1 [--perf-host 10.0.0.1]
+Saida: <outdir>/n16_r1/p01.log ... p16.log, t0.txt e launch.txt (instantes, epoch)
 Cada linha do .log comeca com a hora (epoch, segundos). Requer: sudo apt install moreutils
 Ctrl+C encerra todos os players.
+
+Com --perf-host, avisa o host da VM (coleta_perf.py, porta 8000 se omitida) quando a rodada
+comeca (POST /siga?rodada=n16_r1, e a pasta do host leva esse nome) e quando termina
+(POST /pare), para ele coletar o perf stat durante a rodada. Os instantes das mensagens
+ficam em perf.txt. Se o /siga falhar, a rodada nao comeca.
 """
 import argparse
 import os
@@ -14,19 +19,50 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 ap = argparse.ArgumentParser()
 ap.add_argument("n", type=int, help="numero de clientes")
 ap.add_argument("--run", default="r1", help="rotulo da repeticao (r1..r5)")
 ap.add_argument("--url", default="http://192.168.122.30/videos/cat.mp4")
 ap.add_argument("--outdir", default="runs")
+ap.add_argument("--perf-host", default=None, metavar="HOST[:PORTA]",
+                help="host que roda coleta_perf.py (omitido: nao coleta perf)")
 args = ap.parse_args()
 
 if shutil.which("ts") is None:
     sys.exit("falta o comando 'ts': sudo apt install moreutils")
 
+perf_host = args.perf_host
+if perf_host and ":" not in perf_host:
+    perf_host += ":8000"
+
+
+def avisa(msg):
+    """POST vazio em http://<perf-host>/<msg>; devolve o texto da resposta."""
+    req = urllib.request.Request(f"http://{perf_host}/{msg}", data=b"", method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.read().decode().strip()
+    except urllib.error.HTTPError as e:   # mostra o motivo enviado pelo host
+        raise OSError(f"HTTP {e.code}: {e.read().decode().strip()}") from None
+
+
 pasta = os.path.join(args.outdir, f"n{args.n:02d}_{args.run}")
 os.makedirs(pasta)  # erro se ja existir: nao sobrescreve rodada anterior
+
+if perf_host:
+    try:
+        sessao = avisa("siga?rodada=" + os.path.basename(pasta))
+    except OSError as e:  # inclui HTTPError (ex.: 409, ja ha coleta em curso)
+        os.rmdir(pasta)
+        sys.exit(f"falha ao enviar /siga para {perf_host}: {e}")
+    with open(os.path.join(pasta, "perf.txt"), "w") as f:
+        f.write(f"siga {time.time():.3f} {sessao}\n")
+    print(f"perf: coleta iniciada em {perf_host} ({sessao})")
+else:
+    print("perf: desativado (use --perf-host para coletar no host da VM)")
 
 # O mpv escreve a linha de status com \r e nao grava hora. O pipeline abaixo troca
 # \r por \n e o `ts` coloca o epoch (s, com microssegundos) no inicio de cada linha.
@@ -45,32 +81,43 @@ mpv = " ".join([
     shlex.quote(args.url)])
 
 t0 = time.time()
-with open(os.path.join(pasta, "t0.txt"), "w") as f:
-    f.write(f"{t0:.3f}\n")
-
-procs = []
-lancamentos = []  # instante (epoch) em que cada player foi lancado
-for i in range(1, args.n + 1):
-    log = shlex.quote(os.path.join(pasta, f"p{i:02d}.log"))
-    pipeline = f"{mpv} 2>&1 | stdbuf -o0 tr '\\r' '\\n' | ts '%.s' > {log}"
-    lancamentos.append(time.time())
-    procs.append(subprocess.Popen(pipeline, shell=True, stdin=subprocess.DEVNULL,
-                                  start_new_session=True))
-with open(os.path.join(pasta, "launch.txt"), "w") as f:
-    for i, t in enumerate(lancamentos, 1):
-        f.write(f"p{i:02d} {t:.3f}\n")
-print(f"{args.n} players lancados; logs em {pasta}/ (Ctrl+C encerra)")
-
 try:
-    for p in procs:
-        p.wait()
-except KeyboardInterrupt:
-    for p in procs:           # cada pipeline esta no seu proprio grupo de processos
+    with open(os.path.join(pasta, "t0.txt"), "w") as f:
+        f.write(f"{t0:.3f}\n")
+
+    procs = []
+    lancamentos = []  # instante (epoch) em que cada player foi lancado
+    for i in range(1, args.n + 1):
+        log = shlex.quote(os.path.join(pasta, f"p{i:02d}.log"))
+        pipeline = f"{mpv} 2>&1 | stdbuf -o0 tr '\\r' '\\n' | ts '%.s' > {log}"
+        lancamentos.append(time.time())
+        procs.append(subprocess.Popen(pipeline, shell=True, stdin=subprocess.DEVNULL,
+                                      start_new_session=True))
+    with open(os.path.join(pasta, "launch.txt"), "w") as f:
+        for i, t in enumerate(lancamentos, 1):
+            f.write(f"p{i:02d} {t:.3f}\n")
+    print(f"{args.n} players lancados; logs em {pasta}/ (Ctrl+C encerra)")
+
+    try:
+        for p in procs:
+            p.wait()
+    except KeyboardInterrupt:
+        for p in procs:           # cada pipeline esta no seu proprio grupo de processos
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except OSError:
+                pass
+        for p in procs:
+            p.wait()
+finally:
+    if perf_host:                 # o /pare sai mesmo com Ctrl+C ou erro no lancamento
         try:
-            os.killpg(p.pid, signal.SIGTERM)
-        except OSError:
-            pass
-    for p in procs:
-        p.wait()
+            resp = avisa("pare")
+            with open(os.path.join(pasta, "perf.txt"), "a") as f:
+                f.write(f"pare {time.time():.3f} {resp}\n")
+            print(f"perf: {resp}")
+        except OSError as e:
+            print(f"AVISO: falha ao enviar /pare para {perf_host}: {e}; "
+                  f"mande manualmente: curl -X POST http://{perf_host}/pare", file=sys.stderr)
 
 print(f"fim em {time.time() - t0:.1f} s")
